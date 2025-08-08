@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <thread>
+#include <atomic>
 
 using hailort::Device;
 using hailort::Hef;
@@ -30,16 +31,6 @@ using hailort::VStreamsBuilder;
 using hailort::InputVStream;
 using hailort::OutputVStream;
 using hailort::MemoryView;
-
-void print_fps(std::int64_t duration, std::string video_path) {
-    cv::VideoCapture capture(video_path);
-    int count = capture.get(cv::CAP_PROP_FRAME_COUNT);
-    double fps = (double)count / (double)duration;
-    std::cout << "-I---------------------------------------------------------------------" << std::endl;
-    std::cout << "-I- Video FPS: " << fps << std::endl;
-    std::cout << "-I---------------------------------------------------------------------" << std::endl;
-    capture.release();
-}
 
 std::string getCmdOption(int argc, char *argv[], const std::string &longOption, const std::string &shortOption) {
     std::string cmd;
@@ -78,31 +69,31 @@ Expected<std::shared_ptr<ConfiguredNetworkGroup>> configure_network_group(Device
     return std::move(network_groups->at(0));
 }
 
-template <typename T> hailo_status write_all(std::vector<InputVStream> &input, std::string &video_path, 
-                                            int height, int width, int channels) {
-    std::cout << "-I- Started write thread " << video_path << std::endl;
-    cv::VideoCapture capture(video_path);
+template <typename T> hailo_status write_all(std::vector<InputVStream> &input, cv::VideoCapture &capture,
+                                            int height, int width, int channels, std::atomic<bool> &should_stop) {
+    std::cout << "-I- Started write thread" << std::endl;
     cv::Mat frame;
-    if(!capture.isOpened())
-        throw "Unable to read video file";
-    for( ; ; ) {
-        capture >> frame;
-
-        if(frame.empty())
+    while (!should_stop) {
+        if (!capture.read(frame)) {
+            std::cout << "Reached end of video stream, stopping." << std::endl;
+            should_stop = true;
             break;
-        
+        }
+
         if (frame.channels() == 3)
             cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
-    
+
         if (frame.rows != height || frame.cols != width)
             cv::resize(frame, frame, cv::Size(width, height), cv::INTER_AREA);
-        
+
         int factor = std::is_same<T, uint8_t>::value ? 1 : 4;  // In case we use float32_t, we have 4 bytes per component
-        auto status = input[0].write(MemoryView(frame.data, height * width * channels * factor)); // Writing height * width, 3 channels of uint8
-        if (HAILO_SUCCESS != status) 
+        auto status = input[0].write(MemoryView(frame.data, height * width * channels * factor));
+        if (HAILO_SUCCESS != status) {
+            should_stop = true;
             return status;
+        }
     }
-    std::cout << "-I- Finished write thread " << video_path << std::endl;
+    std::cout << "-I- Finished write thread" << std::endl;
     return HAILO_SUCCESS;
 }
 
@@ -124,22 +115,44 @@ template <typename T> cv::Mat scdepth_post_process(std::vector<T>& logits, int h
     return output;
 }
 
-template <typename T> hailo_status read_all(std::vector<OutputVStream> &output, std::string &video_path, int height, int width, int frame_count) {
+template <typename T> hailo_status read_all(std::vector<OutputVStream> &output, int height, int width, std::atomic<bool> &should_stop) {
     std::vector<T> data(output[0].get_frame_size());
-    std::vector<cv::String> file_names;
-    std::cout << "-I- Started read thread " << video_path << std::endl;
-    cv::VideoWriter video("./output_video.mp4",cv::VideoWriter::fourcc('m','p','4','v'),30, cv::Size(width,height));
+    std::cout << "-I- Started read thread" << std::endl;
+    
+    auto last_time = std::chrono::high_resolution_clock::now();
+    int fps_counter = 0;
+    double fps = 0.0;
 
-    for (int i = 0; i < frame_count; i++) {
+    while(!should_stop) {
         auto status = output[0].read(MemoryView(data.data(), data.size()));
         if (HAILO_SUCCESS != status){
+            should_stop = true;
             return status;
         }
+
         auto postprocessed_output = scdepth_post_process<T>(data, height, width);
-        video.write(postprocessed_output);
+
+        fps_counter++;
+        auto current_time = std::chrono::high_resolution_clock::now();
+        auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_time).count();
+
+        if (elapsed_time > 1000) {
+            fps = fps_counter * 1000.0 / elapsed_time;
+            fps_counter = 0;
+            last_time = current_time;
+        }
+
+        std::string fps_text = "FPS: " + std::to_string(fps).substr(0, 4);
+        cv::putText(postprocessed_output, fps_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 2);
+
+        cv::imshow("Depth Estimation", postprocessed_output);
+        int key = cv::waitKey(1);
+        if (key == 'q' || key == 27) { // 'q' or ESC
+            should_stop = true;
+        }
     }
-    video.release();
-    std::cout << "-I- Finished read thread " << video_path << std::endl;
+
+    std::cout << "-I- Finished read thread" << std::endl;
     return HAILO_SUCCESS;
 }
 
@@ -157,42 +170,53 @@ void print_net_banner(std::pair< std::vector<InputVStream>, std::vector<OutputVS
     std::cout << "-I---------------------------------------------------------------------\n" << std::endl;
 }
 
-template <typename IN_T, typename OUT_T> hailo_status infer(std::vector<InputVStream> &inputs, std::vector<OutputVStream> &outputs, 
+template <typename IN_T, typename OUT_T> hailo_status infer(std::vector<InputVStream> &inputs, std::vector<OutputVStream> &outputs,
                                                             std::string video_path) {
     hailo_status input_status = HAILO_UNINITIALIZED;
     hailo_status output_status = HAILO_UNINITIALIZED;
-    std::vector<std::thread> output_threads;
-
-    cv::VideoCapture capture(video_path);
-    if (!capture.isOpened()){
-        throw "Error when reading video";
-    }
-    int frame_count = capture.get(cv::CAP_PROP_FRAME_COUNT);
-
-    if (video_path == "input_video.mp4")
-        frame_count -= 5;   // Remove corrupted frames from the frame count
     
-    capture.release();
+    cv::VideoCapture capture;
+    if (video_path.empty()) {
+        capture.open(0); // Open default camera
+        if (!capture.isOpened()) {
+            std::cerr << "-E- Error opening camera" << std::endl;
+            return HAILO_INTERNAL_FAILURE;
+        }
+        std::cout << "-I- Using default camera as input" << std::endl;
+    } else {
+        capture.open(video_path);
+        if (!capture.isOpened()){
+            std::cerr << "-E- Error when reading video file: " << video_path << std::endl;
+            return HAILO_INTERNAL_FAILURE;
+        }
+        std::cout << "-I- Using video file as input: " << video_path << std::endl;
+    }
+
+    std::atomic<bool> should_stop(false);
 
     int input_height = inputs.front().get_info().shape.height;
     int input_width = inputs.front().get_info().shape.width;
     int input_channels = inputs.front().get_info().shape.features;
-    std::thread input_thread([&inputs, &video_path, &input_height, &input_width, &input_channels, &input_status]() { 
-                            input_status = write_all<IN_T>(inputs, video_path, input_height, input_width, input_channels); 
-                            });
-    
+    std::thread input_thread([&]() {
+        input_status = write_all<IN_T>(inputs, std::ref(capture), input_height, input_width, input_channels, std::ref(should_stop));
+    });
+
     int output_height = outputs.front().get_info().shape.height;
     int output_width = outputs.front().get_info().shape.width;
-    std::thread output_thread([&outputs, &video_path, &output_height, &output_width, &output_status, &frame_count]() { 
-                            output_status = read_all<OUT_T>(outputs, video_path, output_height, output_width, frame_count); 
-                            });
+    std::thread output_thread([&]() {
+        output_status = read_all<OUT_T>(outputs, output_height, output_width, std::ref(should_stop));
+    });
 
 
     input_thread.join();
     output_thread.join();
-    
+
+    capture.release();
+    cv::destroyAllWindows();
 
     if ((HAILO_SUCCESS != input_status) || (HAILO_SUCCESS != output_status)) {
+        if (HAILO_SUCCESS != input_status) std::cerr << "-E- Write thread failed with status " << input_status << std::endl;
+        if (HAILO_SUCCESS != output_status) std::cerr << "-E- Read thread failed with status " << output_status << std::endl;
         return HAILO_INTERNAL_FAILURE;
     }
 
@@ -205,7 +229,17 @@ int main(int argc, char** argv) {
     std::string hef_file   = getCmdOption(argc, argv, "--net", "-n");
     std::string video_path = getCmdOption(argc, argv, "--input", "-i");
     auto all_devices       = Device::scan_pcie();
-    std::cout << "-I- video path: " << video_path << std::endl;
+
+    if (hef_file.empty()) {
+        std::cerr << "-E- No HEF file provided. Use --net or -n to specify the HEF file path." << std::endl;
+        return HAILO_INVALID_ARGUMENT;
+    }
+    
+    if (video_path.empty()) {
+        std::cout << "-I- No input video path provided, will try to use camera." << std::endl;
+    } else {
+        std::cout << "-I- video path: " << video_path << std::endl;
+    }
     std::cout << "-I- hef: " << hef_file << "\n" << std::endl;
 
     auto device = Device::create_pcie(all_devices.value()[0]);
@@ -253,12 +287,7 @@ int main(int argc, char** argv) {
         return activated_network_group.status();
     }
     
-    std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-    auto status  = infer<uint8_t, uint8_t>(vstreams.first, vstreams.second, video_path);
-    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-
-    std::int64_t duration = std::chrono::duration_cast<std::chrono::seconds>(end - begin).count();
-    print_fps(duration, video_path);
+    auto status  = infer<uint8_t, float32_t>(vstreams.first, vstreams.second, video_path);
     if (HAILO_SUCCESS != status) {
         std::cerr << "-E- Inference failed "  << status << std::endl;
         return status;
