@@ -75,7 +75,7 @@ template <typename T> hailo_status write_all(std::vector<InputVStream> &input, c
     cv::Mat frame;
     while (!should_stop) {
         if (!capture.read(frame)) {
-            std::cout << "Reached end of video stream, stopping." << std::endl;
+            std::cout << "-E- Failed to read frame from stream, stopping." << std::endl;
             should_stop = true;
             break;
         }
@@ -171,25 +171,30 @@ void print_net_banner(std::pair< std::vector<InputVStream>, std::vector<OutputVS
 }
 
 template <typename IN_T, typename OUT_T> hailo_status infer(std::vector<InputVStream> &inputs, std::vector<OutputVStream> &outputs,
-                                                            std::string video_path) {
+                                                            const std::string& device_path, int frame_rate) {
     hailo_status input_status = HAILO_UNINITIALIZED;
     hailo_status output_status = HAILO_UNINITIALIZED;
     
     cv::VideoCapture capture;
-    if (video_path.empty()) {
-        capture.open(0); // Open default camera
-        if (!capture.isOpened()) {
-            std::cerr << "-E- Error opening camera" << std::endl;
-            return HAILO_INTERNAL_FAILURE;
+    if (isdigit(device_path[0])) {
+        capture.open(std::stoi(device_path));
+    }
+    else {
+        capture.open(device_path);
+    }
+
+    if (!capture.isOpened()){
+        std::cerr << "-E- Error opening camera device: " << device_path << std::endl;
+        return HAILO_INTERNAL_FAILURE;
+    }
+    std::cout << "-I- Using camera device: " << device_path << std::endl;
+
+    if (frame_rate > 0) {
+        if (capture.set(cv::CAP_PROP_FPS, static_cast<double>(frame_rate))) {
+            std::cout << "-I- Frame rate set to " << frame_rate << std::endl;
+        } else {
+            std::cout << "-W- Could not set frame rate to " << frame_rate << ". Using default." << std::endl;
         }
-        std::cout << "-I- Using default camera as input" << std::endl;
-    } else {
-        capture.open(video_path);
-        if (!capture.isOpened()){
-            std::cerr << "-E- Error when reading video file: " << video_path << std::endl;
-            return HAILO_INTERNAL_FAILURE;
-        }
-        std::cout << "-I- Using video file as input: " << video_path << std::endl;
     }
 
     std::atomic<bool> should_stop(false);
@@ -197,12 +202,14 @@ template <typename IN_T, typename OUT_T> hailo_status infer(std::vector<InputVSt
     int input_height = inputs.front().get_info().shape.height;
     int input_width = inputs.front().get_info().shape.width;
     int input_channels = inputs.front().get_info().shape.features;
+    std::cout << "-I- Input resolution: " << input_width << "x" << input_height << std::endl;
     std::thread input_thread([&]() {
         input_status = write_all<IN_T>(inputs, std::ref(capture), input_height, input_width, input_channels, std::ref(should_stop));
     });
 
     int output_height = outputs.front().get_info().shape.height;
     int output_width = outputs.front().get_info().shape.width;
+    std::cout << "-I- Output resolution: " << output_width << "x" << output_height << std::endl;
     std::thread output_thread([&]() {
         output_status = read_all<OUT_T>(outputs, output_height, output_width, std::ref(should_stop));
     });
@@ -227,22 +234,44 @@ template <typename IN_T, typename OUT_T> hailo_status infer(std::vector<InputVSt
 
 int main(int argc, char** argv) {
     std::string hef_file   = getCmdOption(argc, argv, "--net", "-n");
-    std::string video_path = getCmdOption(argc, argv, "--input", "-i");
-    auto all_devices       = Device::scan_pcie();
+    std::string device_path = getCmdOption(argc, argv, "--input", "-i");
+    std::string fps_str = getCmdOption(argc, argv, "--fps", "-f");
 
     if (hef_file.empty()) {
         std::cerr << "-E- No HEF file provided. Use --net or -n to specify the HEF file path." << std::endl;
         return HAILO_INVALID_ARGUMENT;
     }
     
-    if (video_path.empty()) {
-        std::cout << "-I- No input video path provided, will try to use camera." << std::endl;
+    if (device_path.empty()) {
+        std::cout << "-I- No input device provided, using camera 0." << std::endl;
+        device_path = "0";
     } else {
-        std::cout << "-I- video path: " << video_path << std::endl;
+        std::cout << "-I- device path: " << device_path << std::endl;
+    }
+
+    int frame_rate = -1;
+    if (!fps_str.empty()) {
+        try {
+            frame_rate = std::stoi(fps_str);
+            std::cout << "-I- Desired FPS: " << frame_rate << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "-E- Invalid FPS value: " << fps_str << ". It should be an integer." << std::endl;
+            return HAILO_INVALID_ARGUMENT;
+        }
     }
     std::cout << "-I- hef: " << hef_file << "\n" << std::endl;
 
-    auto device = Device::create_pcie(all_devices.value()[0]);
+    auto all_devices = Device::scan_pcie();
+    if (!all_devices) {
+        std::cerr << "-E- Failed to scan pcie devices " << all_devices.status() << std::endl;
+        return all_devices.status();
+    }
+    if (all_devices->empty()) {
+        std::cerr << "-E- No pcie devices found" << std::endl;
+        return HAILO_NOT_FOUND;
+    }
+
+    auto device = Device::create_pcie(all_devices->at(0));
     if (!device) {
         std::cerr << "-E- Failed create_pcie " << device.status() << std::endl;
         return device.status();
@@ -287,7 +316,7 @@ int main(int argc, char** argv) {
         return activated_network_group.status();
     }
     
-    auto status  = infer<uint8_t, float32_t>(vstreams.first, vstreams.second, video_path);
+    auto status  = infer<uint8_t, float32_t>(vstreams.first, vstreams.second, device_path, frame_rate);
     if (HAILO_SUCCESS != status) {
         std::cerr << "-E- Inference failed "  << status << std::endl;
         return status;
